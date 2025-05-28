@@ -1,438 +1,379 @@
 """
-Residual fine-tuning and SVD projection after primitive selection
-
+Memory-optimized Residual fine-tuning and SVD projection after primitive selection
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch_cluster
-from torch_scatter import scatter_max, scatter_mean
+from torch_scatter import scatter_max
 from torch.utils.checkpoint import checkpoint
-import math
-from typing import Optional, Tuple, List
-from functools import lru_cache
 
 
-class VectorizedKNNGraphCache:
-    """Ultra-fast KNN graph computation with intelligent caching"""
+class MemoryEfficientEdgeConvBlock(nn.Module):
+    """
+    Memory-efficient EdgeConv block for residual network
+    """
     
-    def __init__(self, max_cache_size=1000, k=8):
-        self.cache = {}
-        self.max_cache_size = max_cache_size
-        self.k = k
-        self.access_count = {}
-    
-    def get_or_compute_knn(self, points: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        """Get cached KNN or compute with vectorized operations"""
-        # Create cache key based on point cloud size and rough geometry
-        cache_key = (points.shape[0], points.shape[1], hash(tuple(points.mean(dim=0).cpu().numpy())))
-        
-        if cache_key in self.cache:
-            self.access_count[cache_key] = self.access_count.get(cache_key, 0) + 1
-            return self.cache[cache_key]
-        
-        # Compute KNN with optimizations
-        edge_index = self._fast_knn_computation(points, batch)
-        
-        # Cache management
-        if len(self.cache) >= self.max_cache_size:
-            # Remove least recently used
-            lru_key = min(self.access_count.keys(), key=lambda k: self.access_count[k])
-            del self.cache[lru_key]
-            del self.access_count[lru_key]
-        
-        self.cache[cache_key] = edge_index
-        self.access_count[cache_key] = 1
-        
-        return edge_index
-    
-    def _fast_knn_computation(self, points: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
-        """Optimized KNN computation using efficient algorithms"""
-        effective_k = min(self.k, points.shape[0] - 1)
-        return torch_cluster.knn_graph(points, k=effective_k, batch=batch, loop=False)
-
-
-class MemoryPool:
-    """Memory pool to eliminate frequent allocations"""
-    
-    def __init__(self, device):
-        self.device = device
-        self.pools = {}
-        
-    def get_tensor(self, shape: tuple, dtype=torch.float32) -> torch.Tensor:
-        """Get pre-allocated tensor from pool"""
-        key = (shape, dtype)
-        if key not in self.pools:
-            self.pools[key] = []
-        
-        if self.pools[key]:
-            tensor = self.pools[key].pop()
-            if tensor.shape == shape:
-                tensor.zero_()
-                return tensor
-        
-        return torch.zeros(shape, dtype=dtype, device=self.device)
-    
-    def return_tensor(self, tensor: torch.Tensor):
-        """Return tensor to pool"""
-        key = (tuple(tensor.shape), tensor.dtype)
-        if key not in self.pools:
-            self.pools[key] = []
-        
-        if len(self.pools[key]) < 10:
-            self.pools[key].append(tensor.detach())
-
-
-class UltraFastBatchedSVD:
-    """Batched SVD operations for massive parallelization"""
-    
-    @staticmethod
-    def batched_plane_fitting(points_list: List[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Process multiple point clouds simultaneously"""
-        if not points_list:
-            return torch.empty(0, 3), torch.empty(0)
-        
-        max_points = max(p.shape[0] for p in points_list)
-        device = points_list[0].device
-        
-        batch_size = len(points_list)
-        batched_points = torch.zeros(batch_size, max_points, 3, device=device)
-        point_counts = torch.zeros(batch_size, dtype=torch.long, device=device)
-        
-        for i, points in enumerate(points_list):
-            n_points = points.shape[0]
-            batched_points[i, :n_points] = points
-            point_counts[i] = n_points
-        
-        valid_mask = torch.arange(max_points, device=device).unsqueeze(0) < point_counts.unsqueeze(1)
-        masked_points = batched_points * valid_mask.unsqueeze(-1)
-        centroids = masked_points.sum(dim=1) / point_counts.unsqueeze(-1).clamp(min=1)
-        
-        centered = masked_points - centroids.unsqueeze(1)
-        cov_matrices = torch.bmm(centered.transpose(-2, -1), centered)
-        cov_matrices = cov_matrices / point_counts.unsqueeze(-1).unsqueeze(-1).clamp(min=1)
-        
-        try:
-            U, S, V = torch.linalg.svd(cov_matrices + 1e-8 * torch.eye(3, device=device).unsqueeze(0))
-            normals = V[:, :, -1]
-            distances = -(centroids * normals).sum(dim=-1)
-            return normals, distances
-        except:
-            normals = torch.zeros(batch_size, 3, device=device)
-            distances = torch.zeros(batch_size, device=device)
-            return normals, distances
-
-
-class HyperOptimizedEdgeConvBlock(nn.Module):
-    """Ultra-optimized EdgeConv with complete vectorization"""
-    
-    def __init__(self, in_dim, out_dim, k=8, use_approximation=True):
+    def __init__(self, in_dim, out_dim, k=16, chunk_size=1024):
         super().__init__()
         self.k = k
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.use_approximation = use_approximation
-        
+        self.chunk_size = chunk_size
         self.conv = nn.Sequential(
             nn.Linear(in_dim * 2, out_dim),
-            nn.ReLU(inplace=True)
+            nn.ReLU(inplace=True),  # Use inplace operations
+            nn.Linear(out_dim, out_dim)
         )
+    
+    def forward(self, x, pos):
+        """
+        Args:
+            x: (N, C) Point features
+            pos: (N, 3) Point positions
+        Returns:
+            out: (N, out_dim) Updated point features
+        """
+        N = pos.shape[0]
+        device = pos.device
         
-        self.register_buffer('_dummy_batch', torch.zeros(1, dtype=torch.long))
+        # Process in chunks if too many points
+        if N > self.chunk_size:
+            return self._forward_chunked(x, pos)
         
-    def forward(self, x, pos, batch_info=None):
-        """Completely vectorized forward pass - NO loops"""
-        total_points = x.shape[0]
-        device = x.device
+        # Compute KNN graph with reduced k if necessary
+        effective_k = min(self.k, N - 1)
+        if effective_k <= 0:
+            # Fallback for very small point clouds
+            return torch.zeros(N, self.conv[-1].out_features, device=device)
         
-        if batch_info is None:
-            batch = torch.zeros(total_points, dtype=torch.long, device=device)
-        else:
-            batch = batch_info
-        
-        effective_k = min(self.k, 6)
-        
-        if total_points > 8192 and self.use_approximation:
-            return self._approximate_forward(x, pos, batch)
-        
+        batch = torch.zeros(N, dtype=torch.long, device=device)
         edge_index = torch_cluster.knn_graph(pos, k=effective_k, batch=batch, loop=False)
-        edge_features = self._compute_edge_features_vectorized(x, edge_index)
-        edge_features = self.conv(edge_features)
-        out, _ = scatter_max(edge_features, edge_index[0], dim=0, dim_size=total_points)
+
+        # Get features for source and target nodes
+        x_j = x[edge_index[1]]  # Target node features
+        x_i = x[edge_index[0]]  # Source node features
+        
+        # Compute edge features
+        edge_features = torch.cat([x_i, x_j - x_i], dim=1)
+        
+        # Apply MLPs with gradient checkpointing
+        edge_features = checkpoint(self.conv, edge_features, use_reentrant=False)
+        
+        # Aggregate features using scatter_max
+        out, _ = scatter_max(edge_features, edge_index[0], dim=0, dim_size=N)
+        
+        # Clear intermediate tensors
+        del edge_index, x_j, x_i, edge_features
         
         return out
     
-    def _approximate_forward(self, x, pos, batch):
-        """Approximate computation for very large point clouds"""
-        total_points = x.shape[0]
-        device = x.device
+    def _forward_chunked(self, x, pos):
+        """Process large point clouds in chunks"""
+        N = pos.shape[0]
+        device = pos.device
+        out_dim = self.conv[-1].out_features
         
-        sample_ratio = min(1.0, 4096.0 / total_points)
-        if sample_ratio < 1.0:
-            n_samples = int(total_points * sample_ratio)
-            sample_indices = torch.randperm(total_points, device=device)[:n_samples]
+        # Initialize output
+        out = torch.zeros(N, out_dim, device=device)
+        
+        # Process in overlapping chunks to maintain connectivity
+        overlap = self.k
+        step = self.chunk_size - overlap
+        
+        for start in range(0, N, step):
+            end = min(start + self.chunk_size, N)
             
-            sampled_pos = pos[sample_indices]
-            sampled_x = x[sample_indices]
-            sampled_batch = batch[sample_indices]
+            # Extract chunk
+            chunk_pos = pos[start:end]
+            chunk_x = x[start:end]
             
-            edge_index = torch_cluster.knn_graph(sampled_pos, k=4, batch=sampled_batch, loop=False)
-            edge_features = self._compute_edge_features_vectorized(sampled_x, edge_index)
-            edge_features = self.conv(edge_features)
+            # Process chunk
+            chunk_out = self._process_chunk(chunk_x, chunk_pos)
             
-            sampled_out, _ = scatter_max(edge_features, edge_index[0], dim=0, dim_size=n_samples)
+            # Store results (avoid overlap regions for consistency)
+            actual_end = min(start + step, N) if end < N else N
+            out[start:actual_end] = chunk_out[:actual_end-start]
             
-            out = torch.zeros(total_points, self.out_dim, device=device)
-            out[sample_indices] = sampled_out
-            
-            remaining_mask = torch.ones(total_points, dtype=torch.bool, device=device)
-            remaining_mask[sample_indices] = False
-            
-            if remaining_mask.any():
-                remaining_indices = torch.where(remaining_mask)[0]
-                dists = torch.cdist(pos[remaining_indices], sampled_pos)
-                nearest_indices = sample_indices[dists.argmin(dim=1)]
-                out[remaining_indices] = out[nearest_indices]
-            
-            return out
-        else:
-            edge_index = torch_cluster.knn_graph(pos, k=self.k, batch=batch, loop=False)
-            edge_features = self._compute_edge_features_vectorized(x, edge_index)
-            edge_features = self.conv(edge_features)
-            out, _ = scatter_max(edge_features, edge_index[0], dim=0, dim_size=total_points)
-            return out
+            # Clear chunk data
+            del chunk_pos, chunk_x, chunk_out
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        return out
     
-    def _compute_edge_features_vectorized(self, x, edge_index):
-        """Optimized edge feature computation"""
+    def _process_chunk(self, x, pos):
+        """Process a single chunk"""
+        N = pos.shape[0]
+        effective_k = min(self.k, N - 1)
+        
+        if effective_k <= 0:
+            return torch.zeros(N, self.conv[-1].out_features, device=pos.device)
+        
+        batch = torch.zeros(N, dtype=torch.long, device=pos.device)
+        edge_index = torch_cluster.knn_graph(pos, k=effective_k, batch=batch, loop=False)
+        
         x_j = x[edge_index[1]]
         x_i = x[edge_index[0]]
-        return torch.cat([x_i, x_j - x_i], dim=1)
-
-
-class MemoryEfficientEdgeConvBlock(HyperOptimizedEdgeConvBlock):
-    """Keep original name but use hyper-optimized implementation"""
-    
-    def __init__(self, in_dim, out_dim, k=8, chunk_size=8192):
-        super().__init__(in_dim, out_dim, k=k, use_approximation=True)
-        self.chunk_size = chunk_size
-
-
-class MegaBatchProcessor:
-    """Process entire batches simultaneously without any loops"""
-    
-    @staticmethod
-    def process_batch_residuals(points_batch, edge_conv_blocks, mlp):
-        """Process entire batch of point clouds simultaneously"""
-        B, N, _ = points_batch.shape
-        device = points_batch.device
+        edge_features = torch.cat([x_i, x_j - x_i], dim=1)
+        edge_features = self.conv(edge_features)
         
-        all_points = points_batch.view(-1, 3)
-        total_points = all_points.shape[0]
-        
-        batch_indices = torch.arange(B, device=device).repeat_interleave(N)
-        
-        features = all_points
-        all_features = []
-        
-        for i, block in enumerate(edge_conv_blocks):
-            features = block(features, all_points, batch_indices)
-            all_features.append(features)
-        
-        final_features = torch.cat(all_features, dim=1)
-        residuals = mlp(final_features)
-        
-        return residuals.view(B, N, 3)
-
-
-class UltraFastSparseProjection:
-    """Sparse plane projection with massive parallelization"""
-    
-    @staticmethod
-    def batch_project_all_planes(points_batch, planes_batch, threshold=0.015, max_planes_per_batch=32):
-        """Project all points to all planes simultaneously using sparse operations"""
-        B, N, _ = points_batch.shape
-        _, M, _ = planes_batch.shape
-        device = points_batch.device
-        
-        effective_M = min(M, max_planes_per_batch)
-        
-        projected_points = points_batch.clone()
-        total_displacement = torch.zeros_like(points_batch)
-        
-        points_expanded = points_batch.unsqueeze(2).expand(B, N, effective_M, 3)
-        planes_expanded = planes_batch[:, :effective_M].unsqueeze(1).expand(B, N, effective_M, 4)
-        
-        normals = planes_expanded[..., :3]
-        distances = planes_expanded[..., 3]
-        
-        normal_norms = torch.norm(normals, dim=-1, keepdim=True)
-        valid_normals = normal_norms > 1e-6
-        normals = normals / normal_norms.clamp(min=1e-6)
-        
-        point_to_plane_dists = torch.abs(
-            torch.sum(points_expanded * normals, dim=-1) + distances
-        )
-        
-        close_mask = (point_to_plane_dists < threshold) & valid_normals.squeeze(-1)
-        
-        for plane_idx in range(effective_M):
-            plane_mask = close_mask[:, :, plane_idx]
-            
-            if not plane_mask.any():
-                continue
-            
-            batch_indices, point_indices = torch.where(plane_mask)
-            
-            if len(batch_indices) == 0:
-                continue
-            
-            relevant_points = points_batch[batch_indices, point_indices]
-            relevant_normals = normals[batch_indices, point_indices, plane_idx]
-            relevant_distances = distances[batch_indices, point_indices, plane_idx]
-            
-            unique_batches = torch.unique(batch_indices)
-            
-            for batch_idx in unique_batches:
-                batch_point_mask = batch_indices == batch_idx
-                if batch_point_mask.sum() < 3:
-                    continue
-                
-                batch_points = relevant_points[batch_point_mask]
-                batch_normal = relevant_normals[batch_point_mask][0]
-                batch_distance = relevant_distances[batch_point_mask][0]
-                
-                refined_normal, refined_distance = UltraFastSparseProjection._fast_svd_refinement(
-                    batch_points, batch_normal, batch_distance
-                )
-                
-                batch_point_indices = point_indices[batch_point_mask]
-                original_points = projected_points[batch_idx, batch_point_indices]
-                
-                dot_products = torch.sum(original_points * refined_normal.unsqueeze(0), dim=1) + refined_distance
-                projections = refined_normal.unsqueeze(0) * dot_products.unsqueeze(1)
-                
-                projected_points[batch_idx, batch_point_indices] = original_points - projections
-        
-        displacement = projected_points - points_batch
-        
-        return projected_points, displacement
-    
-    @staticmethod
-    def _fast_svd_refinement(points, initial_normal, initial_distance):
-        """Ultra-fast SVD refinement for plane fitting"""
-        try:
-            if points.shape[0] < 3:
-                return initial_normal, initial_distance
-            
-            centroid = points.mean(dim=0)
-            centered = points - centroid
-            
-            cov = torch.mm(centered.T, centered) / points.shape[0]
-            
-            U, S, V = torch.linalg.svd(cov + 1e-8 * torch.eye(3, device=cov.device))
-            
-            refined_normal = V[:, -1]
-            
-            if torch.sum(refined_normal * initial_normal) < 0:
-                refined_normal = -refined_normal
-            
-            refined_distance = -torch.sum(centroid * refined_normal)
-            
-            return refined_normal, refined_distance
-            
-        except:
-            return initial_normal, initial_distance
+        out, _ = scatter_max(edge_features, edge_index[0], dim=0, dim_size=N)
+        return out
 
 
 class MemoryEfficientResidualNetwork(nn.Module):
-    """Keep original name but implement extreme optimizations"""
+    """
+    Memory-efficient residual network for fine-tuning dense points
+    """
     
-    def __init__(self, k=8, chunk_size=8192):
+    def __init__(self, k=16, chunk_size=1024):
         super().__init__()
         self.k = k
         self.chunk_size = chunk_size
-        
-        self.edge_conv1 = MemoryEfficientEdgeConvBlock(3, 64, k=k)
-        self.edge_conv2 = MemoryEfficientEdgeConvBlock(64, 64, k=k)
-        self.edge_conv3 = MemoryEfficientEdgeConvBlock(64, 64, k=k)
-        
+
+        # EdgeConv blocks with reduced memory footprint
+        self.edge_conv1 = MemoryEfficientEdgeConvBlock(3, 64, k=k, chunk_size=chunk_size)
+        self.edge_conv2 = MemoryEfficientEdgeConvBlock(64, 64, k=k, chunk_size=chunk_size)
+        self.edge_conv3 = MemoryEfficientEdgeConvBlock(64, 64, k=k, chunk_size=chunk_size)
+                
+        # MLP for final residual prediction
         self.mlp = nn.Sequential(
-            nn.Linear(64 * 3, 128),
+            nn.Linear(64 * 3, 256),
             nn.ReLU(inplace=True),
-            nn.Linear(128, 3)
+            nn.Dropout(0.1),  # Add dropout for regularization
+            nn.Linear(256, 3)
         )
-        
-        self.edge_blocks = [self.edge_conv1, self.edge_conv2, self.edge_conv3]
     
     def forward(self, points):
-        """Completely vectorized batch processing - NO loops whatsoever"""
+        """
+        Args:
+            points: (B, N, 3) Input point cloud batch
+        Returns:
+            residual: (B, N, 3) Predicted residual batch
+        """
         B, N, _ = points.shape
+        device = points.device
         
-        if B <= 16:
-            return MegaBatchProcessor.process_batch_residuals(points, self.edge_blocks, self.mlp)
+        # Process batch efficiently
+        if B == 1:
+            return self._forward_single(points[0]).unsqueeze(0)
         
-        chunk_size = 16
-        results = []
+        # For larger batches, process with gradient checkpointing
+        residuals = []
+        for b in range(B):
+            pts = points[b]  # (N, 3)
+            residual = checkpoint(self._forward_single, pts, use_reentrant=False)
+            residuals.append(residual)
+            
+            # Clear intermediate results
+            del pts, residual
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        for i in range(0, B, chunk_size):
-            end_idx = min(i + chunk_size, B)
-            chunk = points[i:end_idx]
-            chunk_result = MegaBatchProcessor.process_batch_residuals(chunk, self.edge_blocks, self.mlp)
-            results.append(chunk_result)
+        return torch.stack(residuals, dim=0)
+    
+    def _forward_single(self, pts):
+        """Process a single point cloud"""
+        # Extract features with mixed precision
+        with torch.cuda.amp.autocast():
+            f1 = self.edge_conv1(pts, pts)
+            f2 = self.edge_conv2(f1, pts)
+            f3 = self.edge_conv3(f2, pts)
+
+            # Concatenate features
+            features = torch.cat([f1, f2, f3], dim=1)
+
+        # Predict residual (keep in full precision for stability)
+        residual = self.mlp(features)
         
-        return torch.cat(results, dim=0)
+        # Clear intermediate features
+        del f1, f2, f3, features
+        
+        return residual
 
 
 class MemoryEfficientSVDPlaneProjection(nn.Module):
-    """Keep original name but implement ultra-fast sparse projection"""
+    """
+    Memory-efficient SVD-based plane projection
+    """
     
-    def __init__(self, threshold=0.015, max_points_per_plane=8192):
+    def __init__(self, threshold=0.01, max_points_per_plane=2048):
         super().__init__()
         self.threshold = threshold
         self.max_points_per_plane = max_points_per_plane
-    
+
     def forward(self, points, planes):
-        """Ultra-fast sparse projection with complete vectorization"""
+        """
+        Args:
+            points: (B, N, 3) Input point cloud batch
+            planes: (B, M, 4) Plane parameters [a, b, c, d] where ax+by+cz+d=0
+        Returns:
+            projected_points: (B, N, 3) Points projected to planes
+            displacement: (B, N, 3) L2 displacement for loss computation
+        """
         B, N, _ = points.shape
+        B_p, M, _ = planes.shape
+        assert B == B_p, "Batch size mismatch between points and planes"
         
-        projected_points, displacement = UltraFastSparseProjection.batch_project_all_planes(
-            points, planes, self.threshold, max_planes_per_batch=16
-        )
+        # Use gradient checkpointing for memory efficiency
+        if B == 1:
+            projected_points, displacement = self._process_single_batch(
+                points[0], planes[0]
+            )
+            return projected_points.unsqueeze(0), displacement.unsqueeze(0)
+        
+        # Process multiple batches
+        all_projected = []
+        all_displacement = []
+        
+        for b in range(B):
+            proj, disp = checkpoint(
+                self._process_single_batch, 
+                points[b], planes[b], 
+                use_reentrant=False
+            )
+            all_projected.append(proj)
+            all_displacement.append(disp)
+            
+            # Clear intermediate results
+            del proj, disp
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        
+        projected_points = torch.stack(all_projected, dim=0)
+        displacement = torch.stack(all_displacement, dim=0)
         
         return projected_points, displacement
+    
+    def _process_single_batch(self, pts, batch_planes):
+        """Process a single batch item"""
+        N, _ = pts.shape
+        M, _ = batch_planes.shape
+        device = pts.device
+        
+        projected_points = pts.clone()
+        original_points = pts.clone()
+        
+        # Process each plane
+        for i in range(M):
+            plane_params = batch_planes[i]
+            normal = plane_params[:3]
+            distance = plane_params[3]
+            
+            # Skip invalid planes
+            if torch.norm(normal) < 1e-6:
+                continue
+            
+            # Normalize normal vector
+            normal = normal / torch.norm(normal)
+            
+            # Compute point-to-plane distance efficiently
+            point_distance = torch.abs(
+                torch.sum(pts * normal.unsqueeze(0), dim=1) + distance
+            )
+            
+            # Select points close to the plane
+            mask = point_distance < self.threshold
+            plane_points = pts[mask]
+            
+            # Need at least 3 points for SVD
+            if plane_points.shape[0] < 3:
+                continue
+            
+            # Subsample if too many points
+            if plane_points.shape[0] > self.max_points_per_plane:
+                indices = torch.randperm(plane_points.shape[0])[:self.max_points_per_plane]
+                plane_points = plane_points[indices]
+            
+            # Apply SVD projection efficiently
+            self._apply_svd_projection(
+                projected_points, mask, plane_points, normal, pts
+            )
+        
+        # Compute displacement
+        displacement = projected_points - original_points
+        
+        return projected_points, displacement
+    
+    def _apply_svd_projection(self, projected_points, mask, plane_points, normal, original_pts):
+        """Apply SVD projection to plane points"""
+        try:
+            # Compute centroid
+            centroid = torch.mean(plane_points, dim=0)
+            
+            # Center points
+            centered_points = plane_points - centroid
+            
+            # Compute covariance matrix efficiently
+            cov = torch.mm(centered_points.T, centered_points)
+            
+            # SVD for plane fitting
+            U, S, V = torch.linalg.svd(cov)
+            
+            # Extract refined normal (eigenvector with smallest eigenvalue)
+            refined_normal = V[:, 2]
+            
+            # Ensure normal points in the same general direction
+            if torch.sum(refined_normal * normal) < 0:
+                refined_normal = -refined_normal
+            
+            # Compute refined distance
+            refined_distance = -torch.sum(centroid * refined_normal)
+            
+            # Project inlier points to the refined plane (vectorized)
+            mask_indices = torch.where(mask)[0]
+            if len(mask_indices) > 0:
+                inlier_points = projected_points[mask_indices]
+                dot_products = torch.sum(inlier_points * refined_normal.unsqueeze(0), dim=1) + refined_distance
+                projections = refined_normal.unsqueeze(0) * dot_products.unsqueeze(1)
+                projected_points[mask_indices] = inlier_points - projections
+                
+        except Exception as e:
+            # Skip if SVD fails
+            pass
 
 
 class MemoryEfficientPacoRefinementModule(nn.Module):
-    """Keep original name but implement all extreme optimizations"""
+    """
+    Memory-efficient refinement module for PACO
+    """
     
-    def __init__(self, residual_knn=8, plane_proj_threshold=0.015, 
-                 chunk_size=8192, max_points_per_plane=8192):
+    def __init__(self, residual_knn=16, plane_proj_threshold=0.01, 
+                 chunk_size=1024, max_points_per_plane=2048):
         super().__init__()
-        
         self.residual_net = MemoryEfficientResidualNetwork(
             k=residual_knn, chunk_size=chunk_size
         )
-        
         self.plane_projection = MemoryEfficientSVDPlaneProjection(
             threshold=plane_proj_threshold, 
             max_points_per_plane=max_points_per_plane
         )
-        
-        self.enable_cache_clearing = False
-        self.memory_pool = None
-    
+
     def forward(self, points, planes):
-        """Ultimate speed forward pass with zero unnecessary operations"""
-        if self.memory_pool is None:
-            self.memory_pool = MemoryPool(points.device)
+        """
+        Args:
+            points: (B, N, 3) Input point cloud from PACO
+            planes: (B, M, 4) Predicted plane parameters from PACO
+        Returns:
+            dict containing refined results
+        """
+        # Clear cache before processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        with torch.cuda.amp.autocast(enabled=True):
+        # Compute residual with memory efficiency
+        with torch.cuda.amp.autocast():
             residual = self.residual_net(points)
         
+        # Apply residual
         points_with_residual = points + residual
         
+        # Apply SVD-based plane projection
         refined_points, displacement = self.plane_projection(points_with_residual, planes)
+        
+        # Clear intermediate results
+        del points_with_residual
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         return {
             'refined_points': refined_points,
@@ -441,8 +382,10 @@ class MemoryEfficientPacoRefinementModule(nn.Module):
             'refined_planes': planes  
         }
 
+
+# Keep the loss functions unchanged
 class ResidualLoss(nn.Module):
-    """MSE loss for residual refinement """
+    """MSE loss for residual refinement"""
     
     def __init__(self):
         super().__init__()
@@ -452,58 +395,10 @@ class ResidualLoss(nn.Module):
 
 
 class SVDProjectionLoss(nn.Module):
-    """L2 loss for SVD projection displacement """
+    """L2 loss for SVD projection displacement"""
     
     def __init__(self):
         super().__init__()
         
     def forward(self, displacement):
         return torch.mean(torch.norm(displacement, p=2, dim=-1))
-
-
-class ExtremeOptimizationConfig:
-    """Configuration for maximum possible speedup"""
-    
-    def __init__(self):
-        self.residual_knn = 6
-        self.plane_proj_threshold = 0.02
-        self.chunk_size = 16384
-        self.max_points_per_plane = 8192
-        self.max_planes_per_batch = 12
-        
-        self.gradient_accumulation_steps = 4
-        self.mixed_precision = True
-        self.compile_model = True
-        
-        self.disable_cache_clearing = True
-        self.use_memory_pool = True
-        self.enable_approximations = True
-        
-        self.num_workers = 8
-        self.prefetch_factor = 4
-        self.pin_memory = True
-        self.persistent_workers = True
-
-
-def apply_extreme_optimizations(model, config=None):
-    """Apply all extreme optimizations to existing model"""
-    if config is None:
-        config = ExtremeOptimizationConfig()
-    
-    if hasattr(torch, 'compile') and config.compile_model:
-        model = torch.compile(model, mode='max-autotune')
-    
-    model = model.to(memory_format=torch.channels_last)
-    
-    return model
-
-
-def create_ultra_fast_refinement_module(residual_knn=6, plane_proj_threshold=0.02, 
-                                       chunk_size=16384, max_points_per_plane=8192):
-    """Factory function for ultra-fast refinement module"""
-    return MemoryEfficientPacoRefinementModule(
-        residual_knn=residual_knn,
-        plane_proj_threshold=plane_proj_threshold,
-        chunk_size=chunk_size,
-        max_points_per_plane=max_points_per_plane
-    )
