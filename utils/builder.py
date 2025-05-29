@@ -262,7 +262,25 @@ def load_model(base_model, ckpt_path, logger=None):
         base_ckpt = {k.replace("module.", ""): v for k, v in state_dict['base_model'].items()}
     else:
         raise RuntimeError("Mismatch of checkpoint's weights")
-    base_model.load_state_dict(base_ckpt)
+    
+    # 修复refinement module的键名映射
+    fixed_ckpt = {}
+    for key, value in base_ckpt.items():
+        # 将旧的键名 refinement_residual_net 映射到新的键名 refinement_module.residual_net
+        if key.startswith('refinement_residual_net.'):
+            new_key = key.replace('refinement_residual_net.', 'refinement_module.residual_net.')
+            fixed_ckpt[new_key] = value
+            print_log(f'Mapping checkpoint key: {key} -> {new_key}', logger=logger)
+        else:
+            fixed_ckpt[key] = value
+    
+    # 使用strict=False以防还有其他不匹配的键
+    missing_keys, unexpected_keys = base_model.load_state_dict(fixed_ckpt, strict=False)
+    
+    if missing_keys:
+        print_log(f'Missing keys in checkpoint: {missing_keys}', logger=logger)
+    if unexpected_keys:
+        print_log(f'Unexpected keys in checkpoint: {unexpected_keys}', logger=logger)
 
     # Extract additional information if available
     epoch = -1

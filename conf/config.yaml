@@ -60,9 +60,10 @@ bnmscheduler:
     lowest_decay: 0.01
 
 # training settings
-total_bs : 80
+total_bs : 60
 step_per_update : 1
 max_epoch : 600
+
 
 # loss settings
 loss:
@@ -71,8 +72,8 @@ loss:
   plane_chamfer_loss_weight: 20
   chamfer_norm2_loss_weight: 20
   plane_normal_loss_weight: 1
-  residual_loss_weight: 1.0
-  svd_projection_loss_weight: 0.5
+  residual_loss_weight: 5
+  svd_projection_loss_weight: 5
 
 consider_metric: total_loss
 
@@ -91,6 +92,15 @@ hydra:
   verbose: false
 
 memory_optimization:
-  gradient_checkpointing: true
+  gradient_checkpointing: false
   mixed_precision: true
-  reduce_batch_size: true
+  reduce_batch_size: false
+
+refinement:
+  version: 'adaptive'  # 使用自适应版本
+  residual_knn: 8
+  plane_proj_threshold: 0.01
+  base_chunk_size: 1024  # 基础chunk size，会根据情况自动调整
+  base_max_points_per_plane: 1024  # 基础每平面最大点数
+  base_svd_batch_size: 8  # 基础SVD批处理大小
+  memory_efficient: true  # 是否启用内存优化

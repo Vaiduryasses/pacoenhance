@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.models.layers import DropPath, trunc_normal_
 from pointnet2_ops import pointnet2_utils
-from .refinement import MemoryEfficientPacoRefinementModule, ResidualLoss, SVDProjectionLoss
+from .refinement import ResidualLoss, SVDProjectionLoss,FixedAdaptivePacoRefinementModule
 from . import MODELS
 from .transformer_utils import (
     LayerScale, MLP, Attention, DeformableLocalAttention,
@@ -1109,13 +1109,18 @@ class PaCo(nn.Module):
         self.refinement_mode = getattr(config, 'refinement_mode', 'memory_efficient')
         if self.use_refinement:
             refinement_config = getattr(config, 'refinement', {})
-            # Use memory-efficient version
-            self.refinement_module = MemoryEfficientPacoRefinementModule(
-                residual_knn=getattr(refinement_config, 'residual_knn', 8),  # Reduced from 16
-                plane_proj_threshold=getattr(refinement_config, 'plane_proj_threshold', 0.01),
-                chunk_size=getattr(refinement_config, 'chunk_size', 512),  # Adjustable chunk size
-                max_points_per_plane=getattr(refinement_config, 'max_points_per_plane', 1024)
-            )
+            refinement_version = getattr(refinement_config, 'version', 'adaptive')
+            if refinement_version == 'adaptive':
+               # 使用自适应版本
+               self.refinement_module = FixedAdaptivePacoRefinementModule(
+                    residual_knn=getattr(refinement_config, 'residual_knn', 8),
+                    plane_proj_threshold=getattr(refinement_config, 'plane_proj_threshold', 0.01),
+                    base_chunk_size=getattr(refinement_config, 'base_chunk_size', 1024),
+                    base_max_points_per_plane=getattr(refinement_config, 'base_max_points_per_plane', 1024),
+                    base_svd_batch_size=getattr(refinement_config, 'base_svd_batch_size', 16),
+                    memory_efficient=getattr(refinement_config, 'memory_efficient', True)
+                )
+
             
             self.residual_loss_fn = ResidualLoss()
             self.svd_projection_loss_fn = SVDProjectionLoss()

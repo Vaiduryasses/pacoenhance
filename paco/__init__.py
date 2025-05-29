@@ -3,7 +3,7 @@ MODELS = registry.Registry('models')
 
 from .paco_pipeline import PaCo
 from .refinement import (
-    MemoryEfficientPacoRefinementModule, 
+    FixedAdaptivePacoRefinementModule,  
     ResidualLoss, 
     SVDProjectionLoss
 )
