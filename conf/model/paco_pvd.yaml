@@ -1,0 +1,45 @@
+# PaCoVoxel model configuration - Minimal and precise configuration for paco_pvd_pipeline
+name: PaCoVoxel
+
+# Core PACO parameters (required by PaCoVoxelPipeline.__init__)
+num_queries: 40
+num_points: 51200
+decoder_type: fold
+global_feature_dim: 1024
+
+# PVD Voxel parameters (required by PaCoVoxelPipeline.__init__)
+voxel_resolution: 64
+window_size: 3
+dropout: 0.1
+
+# Encoder configuration (required by SparseVoxelTransformer)
+encoder:
+  embed_dim: 256
+  depth: 8
+  num_heads: 8
+
+# Decoder configuration (required by ProxyDecoder)
+decoder:
+  embed_dim: 256
+  depth: 4
+
+# Repulsion configuration (required by PaCoVoxelLoss.compute_repulsion_loss)
+repulsion:
+  num_neighbors: 16
+  epsilon: 1e-6
+  radius: 0.1
+  kernel_bandwidth: 0.05
+
+# Factor for loss computation (calculated in PaCoVoxel.__init__)
+factor: 64
+
+# PVD loss weights (required by PaCoVoxelLoss.__init__)
+alpha_param: 0.5
+beta_chamfer: 20.0
+
+# Enhanced loss weights (required by PaCoVoxelLoss.__init__)
+w_classification: 1.0
+w_confidence: 0.5
+w_repulsion: 1.0
+w_chamfer_norm1: 1.0
+w_chamfer_norm2: 1.0
